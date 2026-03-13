@@ -17,7 +17,7 @@ pub struct GlobalOptions {
 
 #[derive(Debug)]
 pub enum Command {
-    Client(ClientArgs),
+    Client(Box<ClientArgs>),
     Agent(AgentArgs),
 }
 
@@ -107,7 +107,7 @@ where
         Ok((cli.global, Command::Agent(cli.agent)))
     } else {
         let cli = ClientCli::parse_from(args);
-        Ok((cli.global, Command::Client(cli.client)))
+        Ok((cli.global, Command::Client(Box::new(cli.client))))
     }
 }
 

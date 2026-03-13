@@ -191,6 +191,14 @@ struct EgressFlow {
     last_activity: Arc<Mutex<Instant>>,
 }
 
+struct ReceiverContext {
+    side: Side,
+    last_received: Arc<Mutex<Instant>>,
+    max_dgram: usize,
+    shutdown_rx: watch::Receiver<bool>,
+    error_tx: mpsc::UnboundedSender<String>,
+}
+
 async fn run_forwarding(
     side: Side,
     tunnel_socket: Arc<UdpSocket>,
@@ -224,15 +232,17 @@ async fn run_forwarding(
         error_tx.clone(),
     ));
     tasks.push(spawn_receiver(
-        side,
         tunnel_socket.clone(),
         codec,
         ingress_index.clone(),
         egress_manager.clone(),
-        last_received.clone(),
-        config.max_dgram,
-        shutdown_rx.clone(),
-        error_tx.clone(),
+        ReceiverContext {
+            side,
+            last_received: last_received.clone(),
+            max_dgram: config.max_dgram,
+            shutdown_rx: shutdown_rx.clone(),
+            error_tx: error_tx.clone(),
+        },
     ));
 
     for rule in ingress_index.values() {
@@ -290,17 +300,13 @@ async fn run_forwarding(
     outcome
 }
 
-fn wait_monitor(
-    monitor: Option<JoinHandle<Result<()>>>,
-) -> impl std::future::Future<Output = Result<()>> {
-    async move {
-        match monitor {
-            Some(handle) => match handle.await {
-                Ok(result) => result,
-                Err(err) => Err(anyhow!("monitor task failed: {err}")),
-            },
-            None => std::future::pending::<Result<()>>().await,
-        }
+async fn wait_monitor(monitor: Option<JoinHandle<Result<()>>>) -> Result<()> {
+    match monitor {
+        Some(handle) => match handle.await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("monitor task failed: {err}")),
+        },
+        None => std::future::pending::<Result<()>>().await,
     }
 }
 
@@ -321,8 +327,8 @@ fn spawn_sender(
                 }
                 maybe_frame = outbound_rx.recv() => {
                     let Some(frame) = maybe_frame else { break };
-                    match codec.seal(frame).and_then(|packet| Ok((packet,))) {
-                        Ok((packet,)) => {
+                    match codec.seal(frame) {
+                        Ok(packet) => {
                             if let Err(err) = socket.send(&packet).await {
                                 let _ = error_tx.send(format!("failed to send tunnel packet: {err}"));
                                 break;
@@ -340,22 +346,18 @@ fn spawn_sender(
 }
 
 fn spawn_receiver(
-    side: Side,
     socket: Arc<UdpSocket>,
     codec: Arc<TunnelCodec>,
     ingress_index: Arc<HashMap<u32, Arc<IngressRule>>>,
     egress_manager: Arc<EgressManager>,
-    last_received: Arc<Mutex<Instant>>,
-    max_dgram: usize,
-    mut shutdown_rx: watch::Receiver<bool>,
-    error_tx: mpsc::UnboundedSender<String>,
+    mut context: ReceiverContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; max_dgram + 512];
+        let mut buffer = vec![0u8; context.max_dgram + 512];
         loop {
             tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
+                changed = context.shutdown_rx.changed() => {
+                    if changed.is_err() || *context.shutdown_rx.borrow() {
                         break;
                     }
                 }
@@ -363,7 +365,7 @@ fn spawn_receiver(
                     let size = match recv {
                         Ok(size) => size,
                         Err(err) => {
-                            let _ = error_tx.send(format!("failed to receive tunnel packet: {err}"));
+                            let _ = context.error_tx.send(format!("failed to receive tunnel packet: {err}"));
                             break;
                         }
                     };
@@ -374,9 +376,9 @@ fn spawn_receiver(
                             continue;
                         }
                     };
-                    *last_received.lock().await = Instant::now();
-                    if let Err(err) = handle_frame(side, frame, &ingress_index, &egress_manager).await {
-                        let _ = error_tx.send(format!("tunnel processing failed: {err:#}"));
+                    *context.last_received.lock().await = Instant::now();
+                    if let Err(err) = handle_frame(context.side, frame, &ingress_index, &egress_manager).await {
+                        let _ = context.error_tx.send(format!("tunnel processing failed: {err:#}"));
                         break;
                     }
                 }
