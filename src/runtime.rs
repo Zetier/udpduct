@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::Rng;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -176,14 +176,8 @@ async fn wait_for_stdin_eof<R>(mut reader: R) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = [0u8; 256];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => return Ok(()),
-            Ok(_) => continue,
-            Err(err) => return Err(err.into()),
-        }
-    }
+    tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1055,10 +1049,11 @@ mod tests {
     use super::{
         EgressManager, IngressRule, IngressState, RuntimeConfig, accept_remote_handshake,
         bind_ingress_rules, bind_tunnel_socket, cleanup_interval, extract_host, family_for_addr,
-        flow_belongs_to, perform_local_handshake, run_agent_session, run_forwarding,
-        wildcard_addr,
+        flow_belongs_to, perform_local_handshake, run_agent_session, run_forwarding, wildcard_addr,
     };
-    use crate::protocol::{BootstrapReply, BootstrapRequest, PROTOCOL_VERSION, Side, decode_line, encode_line};
+    use crate::protocol::{
+        BootstrapReply, BootstrapRequest, PROTOCOL_VERSION, Side, decode_line, encode_line,
+    };
     use crate::spec::{ForwardSpec, IpFamily, ListenSide};
     use crate::tunnel::TunnelCodec;
 
@@ -1406,12 +1401,12 @@ mod tests {
             family: Some("ipv4".to_string()),
         };
 
-        let session = tokio::spawn(run_agent_session(
-            BufReader::new(agent_stdin),
-            agent_stdout,
-        ));
+        let session = tokio::spawn(run_agent_session(BufReader::new(agent_stdin), agent_stdout));
         let mut client_stdin = client_stdin;
-        client_stdin.write_all(&encode_line(&request).unwrap()).await.unwrap();
+        client_stdin
+            .write_all(&encode_line(&request).unwrap())
+            .await
+            .unwrap();
         client_stdin.flush().await.unwrap();
 
         let mut stdout = BufReader::new(client_stdout);
@@ -1466,9 +1461,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("tunnel timed out after"));
+        assert!(err.to_string().contains("tunnel timed out after"));
     }
 
     fn make_spec(
