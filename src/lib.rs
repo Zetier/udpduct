@@ -13,7 +13,7 @@ pub async fn run() -> Result<()> {
     cli::init_logging(&global);
 
     match command {
-        cli::Command::Client(args) => runtime::run_client(args, global).await,
+        cli::Command::Client(args) => runtime::run_client(*args, global).await,
         cli::Command::Agent(args) => agent::run(args).await,
     }
 }
