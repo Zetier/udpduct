@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::Rng;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -94,22 +94,15 @@ pub async fn run_client(args: ClientArgs, global: GlobalOptions) -> Result<()> {
 }
 
 pub async fn run_agent_stdio() -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-    let count = reader.read_line(&mut line).await?;
-    if count == 0 {
-        bail!("expected bootstrap request on stdin");
-    }
-    let request: BootstrapRequest =
-        serde_json::from_str(&line).context("failed to parse bootstrap request")?;
-    if request.version != PROTOCOL_VERSION {
-        bail!(
-            "unsupported protocol version {}, expected {}",
-            request.version,
-            PROTOCOL_VERSION
-        );
-    }
+    run_agent_session(BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+}
+
+async fn run_agent_session<R, W>(mut reader: R, mut writer: W) -> Result<()>
+where
+    R: AsyncBufRead + AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let request = read_bootstrap_request(&mut reader).await?;
     let secret = request.secret_bytes()?;
     let family = parse_family(request.family.as_deref())?;
     let keepalive = request.keepalive();
@@ -128,9 +121,8 @@ pub async fn run_agent_stdio() -> Result<()> {
         capabilities: vec!["fixed-session".to_string()],
         error: None,
     };
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(&encode_line(&reply)?).await?;
-    stdout.flush().await?;
+    writer.write_all(&encode_line(&reply)?).await?;
+    writer.flush().await?;
 
     let codec = Arc::new(TunnelCodec::new(secret, request.session_id, Side::Remote)?);
     accept_remote_handshake(
@@ -140,6 +132,7 @@ pub async fn run_agent_stdio() -> Result<()> {
         request.max_dgram,
     )
     .await?;
+    let ssh_monitor = tokio::spawn(async move { wait_for_stdin_eof(reader).await });
 
     run_forwarding(
         Side::Remote,
@@ -153,9 +146,44 @@ pub async fn run_agent_stdio() -> Result<()> {
             idle_timeout,
             max_dgram: request.max_dgram,
         },
-        None,
+        Some(ssh_monitor),
     )
     .await
+}
+
+async fn read_bootstrap_request<R>(reader: &mut R) -> Result<BootstrapRequest>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    let count = reader.read_line(&mut line).await?;
+    if count == 0 {
+        bail!("expected bootstrap request on stdin");
+    }
+    let request: BootstrapRequest =
+        serde_json::from_str(&line).context("failed to parse bootstrap request")?;
+    if request.version != PROTOCOL_VERSION {
+        bail!(
+            "unsupported protocol version {}, expected {}",
+            request.version,
+            PROTOCOL_VERSION
+        );
+    }
+    Ok(request)
+}
+
+async fn wait_for_stdin_eof<R>(mut reader: R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 256];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -842,8 +870,10 @@ async fn bind_tunnel_socket(
         return Ok(UdpSocket::bind(wildcard_addr(port, family)).await?);
     }
     if let Some((start, end)) = udp_port_range {
-        let mut rng = rand::rng();
-        let offset = rng.random_range(0..=(end - start));
+        let offset = {
+            let mut rng = rand::rng();
+            rng.random_range(0..=(end - start))
+        };
         for delta in 0..=(end - start) {
             let port = start + ((offset + delta) % (end - start + 1));
             match UdpSocket::bind(wildcard_addr(port, family)).await {
@@ -1010,10 +1040,13 @@ fn family_for_addr(explicit: Option<IpFamily>, addr: SocketAddr) -> Option<IpFam
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
+    use base64::Engine;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
     use tokio::net::UdpSocket;
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
@@ -1022,9 +1055,10 @@ mod tests {
     use super::{
         EgressManager, IngressRule, IngressState, RuntimeConfig, accept_remote_handshake,
         bind_ingress_rules, bind_tunnel_socket, cleanup_interval, extract_host, family_for_addr,
-        flow_belongs_to, perform_local_handshake, run_forwarding, wildcard_addr,
+        flow_belongs_to, perform_local_handshake, run_agent_session, run_forwarding,
+        wildcard_addr,
     };
-    use crate::protocol::Side;
+    use crate::protocol::{BootstrapReply, BootstrapRequest, PROTOCOL_VERSION, Side, decode_line, encode_line};
     use crate::spec::{ForwardSpec, IpFamily, ListenSide};
     use crate::tunnel::TunnelCodec;
 
@@ -1347,6 +1381,96 @@ mod tests {
         local_target_task.abort();
     }
 
+    #[tokio::test]
+    async fn agent_session_exits_on_stdin_eof_and_releases_listener_port() {
+        let keepalive = Duration::from_secs(5);
+        let (client_stdin, agent_stdin) = duplex(4096);
+        let (agent_stdout, client_stdout) = duplex(4096);
+        let listen_port = reserve_udp_port().await;
+        let request = BootstrapRequest {
+            version: PROTOCOL_VERSION,
+            session_id: [9u8; 16],
+            secret_b64: base64::engine::general_purpose::STANDARD.encode([4u8; 32]),
+            forwards: vec![make_spec(
+                1,
+                ListenSide::Remote,
+                listen_port,
+                "127.0.0.1",
+                9999,
+            )],
+            udp_bind_port: Some(0),
+            udp_port_range: None,
+            keepalive_secs: keepalive.as_secs(),
+            idle_timeout_secs: 60,
+            max_dgram: 1200,
+            family: Some("ipv4".to_string()),
+        };
+
+        let session = tokio::spawn(run_agent_session(
+            BufReader::new(agent_stdin),
+            agent_stdout,
+        ));
+        let mut client_stdin = client_stdin;
+        client_stdin.write_all(&encode_line(&request).unwrap()).await.unwrap();
+        client_stdin.flush().await.unwrap();
+
+        let mut stdout = BufReader::new(client_stdout);
+        let mut line = Vec::new();
+        stdout.read_until(b'\n', &mut line).await.unwrap();
+        let reply: BootstrapReply = decode_line(&line).unwrap();
+        assert_eq!(reply.bound_listeners[0].bound.port(), listen_port);
+
+        let local_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        local_socket.connect(reply.remote_udp_bind).await.unwrap();
+        perform_local_handshake(
+            local_socket,
+            Arc::new(TunnelCodec::new([4u8; 32], request.session_id, Side::Local).unwrap()),
+            keepalive,
+            request.max_dgram,
+        )
+        .await
+        .unwrap();
+
+        drop(client_stdin);
+        timeout(Duration::from_secs(1), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let rebound = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], listen_port)))
+            .await
+            .unwrap();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn watchdog_times_out_without_inbound_tunnel_traffic() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+
+        let err = run_forwarding(
+            Side::Local,
+            socket,
+            Arc::new(TunnelCodec::new([7u8; 32], [8u8; 16], Side::Local).unwrap()),
+            Vec::new(),
+            Vec::new(),
+            RuntimeConfig {
+                family: Some(IpFamily::V4),
+                keepalive: Duration::from_millis(100),
+                idle_timeout: Duration::from_secs(5),
+                max_dgram: 1200,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("tunnel timed out after"));
+    }
+
     fn make_spec(
         rule_id: u32,
         listen_side: ListenSide,
@@ -1382,5 +1506,12 @@ mod tests {
             let _ = stop_rx.await;
             Ok(())
         })
+    }
+
+    async fn reserve_udp_port() -> u16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        port
     }
 }
