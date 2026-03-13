@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/Zetier/udpduct/compare/v0.1.0...v0.1.1) - 2026-03-13
+
+### Fixed
+
+- use PATH, support IPv6 ([#6](https://github.com/Zetier/udpduct/pull/6))
+
+### Other
+
+- automate release-plz releases ([#5](https://github.com/Zetier/udpduct/pull/5))
+- enable merge queues ([#8](https://github.com/Zetier/udpduct/pull/8))
+
 ## [0.1.0](https://github.com/Zetier/udpduct/releases/tag/v0.1.0) - 2026-03-13
 
 ### Added
