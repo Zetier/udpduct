@@ -1,0 +1,24 @@
+[package]
+name = "udpduct"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "SSH-authenticated UDP forwarding with ssh-style -L and -R semantics"
+keywords = ["udp", "ssh", "forwarding", "tunnel", "network"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+hkdf = "0.12"
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+socket2 = "0.5"
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

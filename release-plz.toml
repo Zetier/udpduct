@@ -1,0 +1,21 @@
+[workspace]
+dependencies_update = true
+git_release_enable = true
+git_tag_enable = true
+pr_name = "release: {{ package }} {{ version }}"
+pr_body = """
+## Release checklist
+
+- [ ] Review generated changelog entries
+- [ ] Verify version bump
+- [ ] Confirm CI is green
+"""
+
+[[package]]
+name = "udpduct"
+changelog_update = true
+git_release_latest = true
+git_tag_name = "v{{ version }}"
+release = true
+semver_check = false
+

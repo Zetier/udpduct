@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - name: fmt
+            command: cargo fmt --all -- --check
+          - name: check
+            command: cargo check --locked --all-targets
+          - name: clippy
+            command: cargo clippy --locked --all-targets --all-features -- -D warnings
+          - name: test
+            command: cargo test --locked --all-targets
+    name: ${{ matrix.task.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run ${{ matrix.task.name }}
+        run: ${{ matrix.task.command }}
+
