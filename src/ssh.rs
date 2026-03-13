@@ -104,9 +104,10 @@ fn build_ssh_args(ssh: &SshArgs, remote_path: &str) -> Vec<OsString> {
         args.push(OsString::from(arg));
     }
     args.push(OsString::from(&ssh.destination));
-    args.push(OsString::from(shell_quote(&format!(
-        "{remote_path} agent --stdio"
-    ))));
+    args.push(OsString::from(format!(
+        "{} agent --stdio",
+        shell_quote(remote_path)
+    )));
     args
 }
 
@@ -180,7 +181,7 @@ mod tests {
         assert_eq!(args[args.len() - 2], "user@example.com");
         assert_eq!(
             args.last().unwrap(),
-            "'/opt/udpduct/bin/udpduct agent --stdio'"
+            "'/opt/udpduct/bin/udpduct' agent --stdio"
         );
     }
 }

@@ -56,7 +56,13 @@ pub async fn run_client(args: ClientArgs, global: GlobalOptions) -> Result<()> {
         .await
         .with_context(|| format!("failed to resolve UDP peer `{remote_udp_host}`"))?;
 
-    let tunnel_socket = Arc::new(UdpSocket::bind(wildcard_addr(0, args.family)).await?);
+    let tunnel_socket = Arc::new(
+        UdpSocket::bind(wildcard_addr(
+            0,
+            family_for_addr(args.family, remote_udp_addr),
+        ))
+        .await?,
+    );
     tunnel_socket.connect(remote_udp_addr).await?;
     let codec = Arc::new(TunnelCodec::new(secret, session_id, Side::Local)?);
 
@@ -728,7 +734,9 @@ impl EgressManager {
             .ok_or_else(|| anyhow!("unknown egress rule {rule_id}"))?;
         let target_addr =
             resolve_target_addr(&spec.target_host, spec.target_port, self.family).await?;
-        let socket = Arc::new(UdpSocket::bind(wildcard_addr(0, self.family)).await?);
+        let socket = Arc::new(
+            UdpSocket::bind(wildcard_addr(0, family_for_addr(self.family, target_addr))).await?,
+        );
         socket.connect(target_addr).await?;
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
@@ -990,6 +998,16 @@ fn parse_family(value: Option<&str>) -> Result<Option<IpFamily>> {
     }
 }
 
+fn family_for_addr(explicit: Option<IpFamily>, addr: SocketAddr) -> Option<IpFamily> {
+    explicit.or_else(|| {
+        Some(if addr.is_ipv6() {
+            IpFamily::V6
+        } else {
+            IpFamily::V4
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1003,8 +1021,8 @@ mod tests {
 
     use super::{
         EgressManager, IngressRule, IngressState, RuntimeConfig, accept_remote_handshake,
-        bind_ingress_rules, bind_tunnel_socket, cleanup_interval, extract_host, flow_belongs_to,
-        perform_local_handshake, run_forwarding, wildcard_addr,
+        bind_ingress_rules, bind_tunnel_socket, cleanup_interval, extract_host, family_for_addr,
+        flow_belongs_to, perform_local_handshake, run_forwarding, wildcard_addr,
     };
     use crate::protocol::Side;
     use crate::spec::{ForwardSpec, IpFamily, ListenSide};
@@ -1032,6 +1050,22 @@ mod tests {
         assert_eq!(
             cleanup_interval(Duration::from_secs(30)),
             Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn infers_family_from_socket_address() {
+        assert_eq!(
+            family_for_addr(None, "127.0.0.1:4172".parse().unwrap()),
+            Some(IpFamily::V4)
+        );
+        assert_eq!(
+            family_for_addr(None, "[::1]:4172".parse().unwrap()),
+            Some(IpFamily::V6)
+        );
+        assert_eq!(
+            family_for_addr(Some(IpFamily::V4), "[::1]:4172".parse().unwrap()),
+            Some(IpFamily::V4)
         );
     }
 
