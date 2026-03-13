@@ -4,13 +4,6 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      release:
-        description: Run `release-plz release` instead of `release-plz release-pr`
-        required: true
-        type: boolean
-        default: false
 
 concurrency:
   group: release-plz-${{ github.ref }}
@@ -54,7 +47,6 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   release:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
